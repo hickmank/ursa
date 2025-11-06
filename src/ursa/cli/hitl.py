@@ -8,10 +8,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import httpx
+from langchain.chat_models import init_chat_model
+from langchain.embeddings import init_embeddings
 from langchain_core.messages import HumanMessage
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langgraph.checkpoint.sqlite import SqliteSaver
-from pydantic import SecretStr
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.theme import Theme
@@ -21,6 +21,7 @@ from ursa.agents import (
     ArxivAgent,
     ChatAgent,
     ExecutionAgent,
+    HypothesizerAgent,
     PlanningAgent,
     RecallAgent,
     WebSearchAgent,
@@ -49,22 +50,19 @@ def make_console():
     )
 
 
-def wrap_api_key(api_key: Optional[str]) -> Optional[SecretStr]:
-    return None if api_key is None else SecretStr(api_key)
-
-
 @dataclass
 class HITL:
     workspace: Path
     llm_model_name: str
-    llm_base_url: str
+    llm_base_url: Optional[str]
     llm_api_key: Optional[str]
     max_completion_tokens: int
     emb_model_name: str
-    emb_base_url: str
+    emb_base_url: Optional[str]
     emb_api_key: Optional[str]
     share_key: bool
     thread_id: str
+    safe_codes: list[str]
     arxiv_summarize: bool
     arxiv_process_images: bool
     arxiv_max_results: int
@@ -73,6 +71,13 @@ class HITL:
     arxiv_vectorstore_path: Optional[Path]
     arxiv_download_papers: bool
     ssl_verify: bool
+
+    def _make_kwargs(self, **kwargs):
+        # NOTE: This is required instead of setting to None because of
+        # strangeness in init_chat_model.
+        return {
+            key: value for key, value in kwargs.items() if value is not None
+        }
 
     def get_path(self, path: Optional[Path], default_subdir: str) -> str:
         if path is None:
@@ -100,22 +105,27 @@ class HITL:
                 case str(), None:
                     self.emb_api_key = self.llm_api_key
 
-        llm_api_secret = wrap_api_key(self.llm_api_key)
-        emb_api_secret = wrap_api_key(self.emb_api_key)
-
-        self.model = ChatOpenAI(
+        self.model = init_chat_model(
             model=self.llm_model_name,
             max_completion_tokens=self.max_completion_tokens,
-            base_url=self.llm_base_url,
-            api_key=llm_api_secret,
-            http_client=None if self.ssl_verify else httpx.Client(verify=False),
+            **self._make_kwargs(
+                http_client=None
+                if self.ssl_verify
+                else httpx.Client(verify=False),
+                base_url=self.llm_base_url,
+                api_key=self.llm_api_key,
+            ),
         )
 
-        self.embedding = OpenAIEmbeddings(
+        self.embedding = init_embeddings(
             model=self.emb_model_name,
-            base_url=self.emb_base_url,
-            api_key=emb_api_secret,
-            http_client=None if self.ssl_verify else httpx.Client(verify=False),
+            **self._make_kwargs(
+                http_client=None
+                if self.ssl_verify
+                else httpx.Client(verify=False),
+                base_url=self.emb_base_url,
+                api_key=self.emb_api_key,
+            ),
         )
 
         self.memory = AgentMemory(
@@ -126,6 +136,7 @@ class HITL:
         self.arxiv_state = []
         self.chatter_state = {"messages": []}
         self.executor_state = {}
+        self.hypothesizer_state = {}
         self.planner_state = {}
         self.websearcher_state = []
 
@@ -175,6 +186,19 @@ class HITL:
             checkpointer=self.executor_checkpointer,
             agent_memory=self.memory,
             thread_id=self.thread_id + "_executor",
+            safe_codes=self.safe_codes,
+        )
+
+    @cached_property
+    def hypothesizer(self) -> HypothesizerAgent:
+        edb_path = self.workspace / "checkpoint.db"
+        edb_path.parent.mkdir(parents=True, exist_ok=True)
+        econn = sqlite3.connect(str(edb_path), check_same_thread=False)
+        self.executor_checkpointer = SqliteSaver(econn)
+        return HypothesizerAgent(
+            llm=self.model,
+            checkpointer=self.executor_checkpointer,
+            thread_id=self.thread_id + "_hypothesizer",
         )
 
     @cached_property
@@ -209,7 +233,7 @@ class HITL:
     def rememberer(self) -> RecallAgent:
         return RecallAgent(llm=self.model, memory=self.memory)
 
-    def run_arvix(self, prompt: str) -> str:
+    def run_arxiv(self, prompt: str) -> str:
         llm_search_query = self.model.invoke(
             f"The user stated {prompt}. Generate between 1 and 8 words for a search query to address the users need. Return only the words to search."
         ).content
@@ -288,6 +312,20 @@ class HITL:
         self.update_last_agent_result(chat_output.content)
         # return f"[{self.model.model_name}]: {self.last_agent_result}"
         return f"{self.last_agent_result}"
+
+    def run_hypothesizer(self, prompt: str) -> str:
+        question = f"The last agent output was: {self.last_agent_result}\n\nThe user stated: {prompt}"
+
+        self.hypothesizer_state = self.hypothesizer.invoke(
+            prompt=question,
+            max_iterations=2,
+        )
+
+        solution = self.hypothesizer_state.get(
+            "solution", "Hypothesizer failed to return a solution"
+        )
+        self.update_last_agent_result(solution)
+        return f"[Hypothesizer Agent Output]:\n {self.last_agent_result}"
 
     def run_planner(self, prompt: str) -> str:
         self.planner_state.setdefault("messages", [])
@@ -384,7 +422,7 @@ class UrsaRepl(Cmd):
 
     def do_arxiv(self, _: str):
         """Run ArxivAgent"""
-        self.show(self.run_agent("Arxiv Agent", self.hitl.run_arvix))
+        self.show(self.run_agent("Arxiv Agent", self.hitl.run_arxiv))
 
     def do_plan(self, _: str):
         """Run PlanningAgent"""
@@ -401,6 +439,12 @@ class UrsaRepl(Cmd):
     def do_recall(self, _: str):
         """Run RecallAgent"""
         self.show(self.run_agent("Recall Agent", self.hitl.run_rememberer))
+
+    def do_hypothesize(self, _: str):
+        """Run HypothesizerAgent"""
+        self.show(
+            self.run_agent("Hypothesizer Agent", self.hitl.run_hypothesizer)
+        )
 
     def run(self):
         """Handle Ctrl+C to avoid quitting the program"""
@@ -419,16 +463,32 @@ class UrsaRepl(Cmd):
 
     def do_models(self, _: str):
         """List models and base urls"""
+        llm_provider, llm_name = get_provider_and_model(
+            self.hitl.llm_model_name
+        )
         self.show(
-            f"[dim]*[/] LLM: [emph]{self.hitl.model.model_name} "
-            f"[dim]{self.hitl.llm_base_url}",
+            f"[dim]*[/] LLM: [emph]{llm_name} "
+            f"[dim]{self.hitl.llm_base_url or llm_provider}",
             markdown=False,
+        )
+
+        emb_provider, emb_name = get_provider_and_model(
+            self.hitl.llm_model_name
         )
         self.show(
             f"[dim]*[/] Embedding Model: [emph]{self.hitl.embedding.model} "
-            f"[dim]{self.hitl.emb_base_url}",
+            f"[dim]{self.hitl.emb_base_url or emb_provider}",
             markdown=False,
         )
+
+
+def get_provider_and_model(model_str: str):
+    if ":" in model_str:
+        provider, model = model_str.split(":", 1)
+    else:
+        provider = "openai"
+        model = model_str
+    return provider, model
 
 
 # TODO:
