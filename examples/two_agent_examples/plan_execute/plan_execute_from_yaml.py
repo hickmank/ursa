@@ -1055,11 +1055,15 @@ def main(
                     problem_text=problem,
                     workspace=workspace,
                     out_dir=workspace,
-                    size="1536x1024",
+                    # let aspect pick a good size automatically; or keep size if you prefer
+                    # size="1536x1024",
                     background="opaque",
                     quality="high",
                     n=4,
                     style="random",
+                    mode="scene",
+                    aspect="wide",  # optional, auto-sets to a wide rectangle
+                    style_intensity="overt",  # optional, stronger systle signaling
                     console=console,
                     on_done=lambda p: console.print(
                         Panel.fit(
@@ -1487,9 +1491,10 @@ def parse_args_and_user_inputs():
     DEFAULT_MODELS = tuple(
         models_cfg.get("choices")
         or (
+            "openai:gpt-5",
             "openai:gpt-5-mini",
-            "openai:gpt-5-mini",
-            "openai:gpt-5-mini",
+            "openai:o3",
+            "openai:o3-mini",
         )
     )
     DEFAULT_MODEL = models_cfg.get("default")  # may be None
